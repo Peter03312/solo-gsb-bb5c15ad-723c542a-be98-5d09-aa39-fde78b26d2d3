@@ -65,7 +65,8 @@ def preview_reagent_merge(payload: ReagentMergeIn, db: Session = Depends(get_db)
 def confirm_reagent_merge(payload: ReagentMergeConfirmIn, db: Session = Depends(get_db)):
     """凭预览令牌执行合并。
 
-    预览后任一档案属性或受影响步骤变化 → 409 并要求重新预览；
+    预览后任一档案属性或受影响步骤变化（含步骤经安全确认接口被再次确认、
+    仅刷新了确认时间）→ 409 并要求重新预览（令牌一次性、已作废）；
     通过后单事务完成：步骤引用迁移 → 展示快照更新 → 已确认步骤转待复核
     → 删除来源档案。失败时整体回滚，不留下部分迁移。
     """

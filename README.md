@@ -439,9 +439,13 @@ UTF-8 编码（允许 BOM），首行为表头，逗号分隔（兼容 `;` / 制
 2. **✅ 确认合并**（`POST /api/reagents/merge/confirm`，携带同一令牌）：服务端重新读取数据并比对——
    - 来源 / 保留任一**档案属性**（名称 / CAS / 分子式 / 浓度 / 物态 / 类别 / 备注 / 内置标记）变化；
    - **受影响步骤集合或内容**变化（步骤被修改 / 删除、引用被改到别的试剂、来源档案新增了引用）；
+   - **受影响步骤的安全确认数据变化**：含措施、安全备注、确认指纹，以及
+     **预览后经 `PUT /api/plans/{plan_id}/steps/{step_id}/safety` 再次确认导致的确认时间刷新**
+     （即使措施 / 备注 / 确认指纹一字未变，只要确认时间更新即视为已变）；
    - 令牌缺失、伪造、已过期或已被使用过一次；
 
-   以上任一情况都返回 **`409`** 并提示**重新预览**（令牌同时作废），不做任何写入。
+   以上任一情况都返回 **`409`** 并提示**重新预览**（令牌同时作废），不迁移任何步骤引用、
+   不删除来源档案、不改动步骤的确认状态。
 3. 校验通过后，在**单个数据库事务**内顺序完成：
    1. 把引用来源档案的步骤 `reagent_id` 全部改为保留档案；
    2. 更新步骤**展示快照**：试剂名改为保留档案名、类别改为由保留档案实时解析（快照留空）；
@@ -487,7 +491,34 @@ UTF-8 编码（允许 BOM），首行为表头，逗号分隔（兼容 `;` / 制
 
 **4xx 约定**：来源与保留为同一档案 → `422`；任一档案不存在 → `404`（预览）/ `409`（确认阶段，
 提示重新预览）；令牌缺失 / 过短 → `422`；令牌无效、过期、已使用或与所选档案不一致，
-或预览后档案属性 / 受影响步骤发生变化 → `409`（要求重新预览，不落库、无部分迁移）。
+或预览后档案属性 / 受影响步骤（含安全确认时间）发生变化 → `409`（要求重新预览，不落库、无部分迁移）。
+
+调用示例（curl）：
+
+```bash
+# 1) 预览（不落库），记下 confirm_token
+curl -sS -X POST http://127.0.0.1:8000/api/reagents/merge/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"source_reagent_id": 12, "target_reagent_id": 3}'
+
+# 2) 若预览后又对受影响步骤做过安全确认（哪怕措施/备注完全相同，确认时间也会刷新），
+#    直接确认会得到 409：
+curl -sS -X POST http://127.0.0.1:8000/api/plans/7/steps/31/safety \
+  -H 'Content-Type: application/json' \
+  -d '{"safety_measures": ["goggles"], "safety_note": "通风橱内操作", "confirmed": true}'
+
+curl -sS -X POST http://127.0.0.1:8000/api/reagents/merge/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"source_reagent_id": 12, "target_reagent_id": 3, "confirm_token": "预览返回的令牌"}'
+# → HTTP 409 {"detail": "受影响的方案步骤在预览后已变化（……或安全确认被再次提交导致确认时间更新），请重新预览后再确认。"}
+#    旧令牌一次性作废；未迁移任何引用、来源档案仍在，重新预览后再确认即可。
+
+# 3) 预览后无任何变化 → 同一令牌立即确认（10 分钟内、仅可用一次）
+curl -sS -X POST http://127.0.0.1:8000/api/reagents/merge/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"source_reagent_id": 12, "target_reagent_id": 3, "confirm_token": "预览返回的令牌"}'
+# → 200 {"kind": "labmix-reagent-merge-result", "source_reagent_id": 12, "target_reagent_id": 3, ...}
+```
 
 ## 九、导出的 JSON 结果结构
 

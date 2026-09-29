@@ -7,10 +7,11 @@
    并签发一个**仅对本次预览有效**的确认令牌（内存存储、一次性、带 TTL），
    令牌绑定预览时刻的档案属性指纹与受影响步骤快照指纹；
 2. ``confirm_merge``：重新计算两侧属性与受影响步骤快照，与令牌比对——
-   任一档案属性或任一受影响步骤发生变化（含步骤被删除 / 迁出、新增引用），
-   拒绝提交（409）并要求重新预览；通过后在**单个事务**内完成：
-   步骤引用迁移 → 步骤展示快照（试剂名 / 类别）更新 → 已确认步骤安全确认
-   转待复核 → 删除来源档案。任一步失败整体回滚，不留下部分迁移。
+   任一档案属性或任一受影响步骤发生变化（含步骤被删除 / 迁出、新增引用，
+   以及安全确认被经现有确认接口再次提交——措施 / 备注 / 确认指纹虽未变，
+   确认时间已更新），拒绝提交（409）并要求重新预览；通过后在**单个事务**
+   内完成：步骤引用迁移 → 步骤展示快照（试剂名 / 类别）更新 → 已确认步骤
+   安全确认转待复核 → 删除来源档案。任一步失败整体回滚，不留下部分迁移。
 
 历史推演报告（runs.report）是自包含 JSON 快照，合并过程不触碰；
 合并后方案详情 / 列表立即按保留档案解析名称与类别。
@@ -73,7 +74,10 @@ def _affected_steps(db: Session, source_id: int) -> list[models.Step]:
 
 # 受影响步骤纳入快照指纹的字段：迁移只改 reagent_id / reagent_name / categories
 # 与安全待复核标记，故步骤本身的引用关系、顺序、用量、时刻、备注、既有安全
-# 确认数据只要变化（含步骤被删除）就与预览不一致，必须拒绝并重新预览。
+# 确认数据（措施 / 备注 / 确认指纹 / **确认时间**）只要变化（含步骤被删除）
+# 就与预览不一致，必须拒绝并重新预览。安全确认时间必须纳入：预览后用户可能
+# 经现有安全确认接口再次确认，措施 / 备注 / 确认指纹均不变、仅确认时间刷新，
+# 漏掉它就会按"未变"放行旧预览。
 _STEP_SNAPSHOT_FIELDS = (
     "id",
     "plan_id",
@@ -89,12 +93,27 @@ _STEP_SNAPSHOT_FIELDS = (
 )
 
 
+def _confirmed_at_iso(value) -> str | None:
+    """归一化安全确认时间参与指纹。
+
+    SQLite 的 DateTime 列不带时区（写入带时区值会被截成 naive UTC），
+    故统一把 naive 时间按 UTC 处理，再输出带时区偏移的 ISO 串，
+    保证预览与确认两侧（可能一为内存态、一为回读态）口径一致。
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
 def _step_fingerprint(step: models.Step) -> str:
     parts = {key: getattr(step, key) for key in _STEP_SNAPSHOT_FIELDS}
     parts["categories"] = json.loads(step.categories or "[]")
     parts["safety_measures"] = json.loads(step.safety_measures or "[]")
     parts["safety_note"] = step.safety_note
     parts["safety_confirmed_fp"] = step.safety_confirmed_fp
+    parts["safety_confirmed_at"] = _confirmed_at_iso(step.safety_confirmed_at)
     return _sha(parts)
 
 
@@ -299,8 +318,8 @@ def confirm_merge(db: Session, source_id: int, target_id: int, token: str) -> di
     if current_ids != record["step_ids"] or _sha([_step_fingerprint(s) for s in steps]) != record["steps_fp"]:
         raise HTTPException(
             409,
-            "受影响的方案步骤在预览后已变化（步骤被修改 / 删除或来源档案新增了引用），"
-            "请重新预览后再确认。",
+            "受影响的方案步骤在预览后已变化（步骤被修改 / 删除、来源档案新增了引用，"
+            "或安全确认被再次提交导致确认时间更新），请重新预览后再确认。",
         )
 
     try:
