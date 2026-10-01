@@ -35,9 +35,12 @@
 再按**桶内试剂名称序列**给出稳定结果。界面展示每桶组成、负载与促使两股分隔的规则依据；
 单股超容量时返回明确原因且不生成部分方案。预览接口**不落库**，不影响现有方案推演与规则版本逻辑。
 
-**重复档案合并（v1.5 新增）**：在 **🧪 试剂档案** 页选择**来源档案**与**保留档案**，先**预览**
+**重复档案合并（v1.5 新增；v1.5.1 收紧过期预览判定）**：在 **🧪 试剂档案** 页选择**来源档案**与**保留档案**，先**预览**
 受影响的方案步骤数量、逐方案步骤与两侧名称 / 相容性类别，并取得一个**仅对本次预览有效**的
 一次性确认令牌；确认时若任一档案属性或任一受影响步骤在预览后发生变化，**拒绝提交并要求重新预览**。
+v1.5.1 起，受影响步骤在预览后经既有安全确认接口（`PUT /api/plans/{id}/steps/{sid}/safety`）
+**再次确认**时，即使措施、备注与确认指纹均未改变、仅**确认时间**被刷新，也视为预览过期：
+同样返回 409、令牌作废，不迁移引用、不删除来源档案，需重新预览后再确认。
 通过后在**单个事务**内把来源档案的步骤引用迁到保留档案、同步步骤展示快照（名称 / 类别），
 并令这些步骤已完成的安全确认转为**待复核**，随后删除来源档案——**失败时整体回滚，不留下部分迁移**；
 历史推演报告保持原快照不变，合并后方案列表与方案详情立即显示保留档案。
@@ -439,9 +442,13 @@ UTF-8 编码（允许 BOM），首行为表头，逗号分隔（兼容 `;` / 制
 2. **✅ 确认合并**（`POST /api/reagents/merge/confirm`，携带同一令牌）：服务端重新读取数据并比对——
    - 来源 / 保留任一**档案属性**（名称 / CAS / 分子式 / 浓度 / 物态 / 类别 / 备注 / 内置标记）变化；
    - **受影响步骤集合或内容**变化（步骤被修改 / 删除、引用被改到别的试剂、来源档案新增了引用）；
+   - 受影响步骤的**既有安全确认数据**变化，包括经
+     `PUT /api/plans/{plan_id}/steps/{step_id}/safety` **再次确认**——即使勾选措施、安全备注与
+     确认指纹（`safety_confirmed_fp`）都未变，仅**确认时间**（`safety_confirmed_at`）被刷新，
+     也判定为旧预览已过期；
    - 令牌缺失、伪造、已过期或已被使用过一次；
 
-   以上任一情况都返回 **`409`** 并提示**重新预览**（令牌同时作废），不做任何写入。
+   以上任一情况都返回 **`409`** 并提示**重新预览**（令牌同时作废；不迁移任何引用、不删除来源档案），不做任何写入。
 3. 校验通过后，在**单个数据库事务**内顺序完成：
    1. 把引用来源档案的步骤 `reagent_id` 全部改为保留档案；
    2. 更新步骤**展示快照**：试剂名改为保留档案名、类别改为由保留档案实时解析（快照留空）；
@@ -463,7 +470,7 @@ UTF-8 编码（允许 BOM），首行为表头，逗号分隔（兼容 `;` / 制
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/reagents/merge/preview` | 合并预览：请求 `{ "source_reagent_id", "target_reagent_id" }`，返回两侧属性、受影响步骤数 / 逐方案明细与 `confirm_token`，不落库 |
-| POST | `/api/reagents/merge/confirm` | 确认合并：请求 `{ "source_reagent_id", "target_reagent_id", "confirm_token" }`，乐观校验通过后单事务迁移并删除来源档案 |
+| POST | `/api/reagents/merge/confirm` | 确认合并：请求 `{ "source_reagent_id", "target_reagent_id", "confirm_token" }`，乐观校验（含安全确认时间）通过后单事务迁移并删除来源档案 |
 
 预览响应（摘要）：
 
@@ -487,7 +494,52 @@ UTF-8 编码（允许 BOM），首行为表头，逗号分隔（兼容 `;` / 制
 
 **4xx 约定**：来源与保留为同一档案 → `422`；任一档案不存在 → `404`（预览）/ `409`（确认阶段，
 提示重新预览）；令牌缺失 / 过短 → `422`；令牌无效、过期、已使用或与所选档案不一致，
-或预览后档案属性 / 受影响步骤发生变化 → `409`（要求重新预览，不落库、无部分迁移）。
+或预览后档案属性 / 受影响步骤（含仅安全确认时间刷新的"再次确认"）发生变化 → `409`
+（要求重新预览，不落库、无部分迁移）。
+
+### 调用示例（curl）
+
+```bash
+# 1) 预览（不落库），取得仅本次预览有效的一次性令牌（10 分钟有效）
+curl -sS -X POST http://localhost:8000/api/reagents/merge/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"source_reagent_id": 12, "target_reagent_id": 3}'
+# -> { "kind": "labmix-reagent-merge-preview",
+#      "source": {...}, "target": {...},
+#      "affected_step_count": 4, "affected_plan_count": 2,
+#      "will_reset_to_review_count": 2, "affected_plans": [...],
+#      "confirm_token": "tC3…", "token_expires_in_seconds": 600 }
+
+# 2) 预览后、确认前，若对受影响步骤再次做安全确认（即使措施 / 备注未变，
+#    仅确认时间 safety_confirmed_at 被刷新），旧令牌即过期：
+curl -sS -X PUT http://localhost:8000/api/plans/7/steps/31/safety \
+  -H 'Content-Type: application/json' \
+  -d '{"safety_measures": ["goggles"], "safety_note": "通风橱内操作", "confirmed": true}'
+# -> 200 { "step_id": 31, "safety": { "confirmed": true, "confirmed_at": "…(已刷新)" }, ... }
+
+# 3) 用旧令牌确认 → 409，detail 提示重新预览；令牌同时作废，不迁移 / 不删除
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  http://localhost:8000/api/reagents/merge/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"source_reagent_id": 12, "target_reagent_id": 3, "confirm_token": "tC3…"}'
+# -> 409
+# {"detail":"受影响的方案步骤在预览后已变化（…或步骤被再次安全确认 / 取消确认——
+#   即使措施、备注与确认指纹未变，确认时间已更新），请重新预览后再确认。"}
+
+# 4) 重新预览取得新令牌后再确认 → 200，单事务完成迁移并删除来源档案
+curl -sS -X POST http://localhost:8000/api/reagents/merge/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"source_reagent_id": 12, "target_reagent_id": 3}'   # 取新的 confirm_token
+curl -sS -X POST http://localhost:8000/api/reagents/merge/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"source_reagent_id": 12, "target_reagent_id": 3, "confirm_token": "<新令牌>"}'
+# -> { "kind": "labmix-reagent-merge-result", "source_reagent_id": 12,
+#      "target_reagent_id": 3, "migrated_step_count": 4, ... }
+```
+
+> 请求 / 响应字段、状态码与错误结构均与 v1.5 完全兼容，本次仅收紧确认阶段的一致性校验
+> （把安全确认时间纳入受影响步骤指纹）；一次性令牌、10 分钟 TTL、单事务迁移与
+> 已确认步骤转待复核的行为不变。
 
 ## 九、导出的 JSON 结果结构
 
@@ -617,7 +669,7 @@ UTF-8 编码（允许 BOM），首行为表头，逗号分隔（兼容 `;` / 制
 | GET | `/api/reagents?q=` | 试剂列表（可按名称/CAS/分子式搜索） |
 | POST/PUT/DELETE | `/api/reagents[/{id}]` | 试剂增改删（被步骤引用时拒绝删除） |
 | POST | `/api/reagents/merge/preview` | **重复档案合并预览：两侧名称/类别、受影响步骤数与逐方案明细，返回仅本次有效的确认令牌（不落库）** |
-| POST | `/api/reagents/merge/confirm` | **确认合并：属性或步骤已变则 409 拒绝；通过后单事务迁移引用、更新快照、安全确认转待复核并删除来源档案** |
+| POST | `/api/reagents/merge/confirm` | **确认合并：属性或步骤已变（含仅安全确认时间刷新的再次确认）则 409 拒绝；通过后单事务迁移引用、更新快照、安全确认转待复核并删除来源档案** |
 | GET/POST | `/api/plans` | 方案列表 / 新建（含步骤，步骤可携带 `safety_*` 确认数据） |
 | POST | `/api/plans/import/preview` | **CSV 导入预览：逐行校验，返回行号与原因，不落库** |
 | POST | `/api/plans/import` | **CSV 导入提交：单事务创建方案 + 步骤；非法整体拒绝（422），未知试剂未确认 409** |

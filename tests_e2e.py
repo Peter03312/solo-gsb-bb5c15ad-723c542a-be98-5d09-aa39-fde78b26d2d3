@@ -1,6 +1,7 @@
 """端到端冒烟测试：通过 HTTP API 覆盖主要业务路径。"""
 import json
 import sys
+import time
 import urllib.request
 import urllib.error
 
@@ -920,6 +921,40 @@ s, e = call("POST", "/api/reagents/merge/confirm",
 check("步骤变化后确认被拒 409", s == 409 and "步骤" in e["detail"], (s, e))
 s, still_src2 = call("GET", f"/api/reagents/{merge_src}")
 check("步骤变化拒绝后来源仍在（无部分迁移）", still_src2 is not None and still_src2["id"] == merge_src, s)
+
+# 乐观并发：预览后受影响步骤经既有安全确认接口"再次确认"——措施 / 备注 /
+# 确认指纹均未变，仅 safety_confirmed_at 被刷新 → 同样拒绝（修复旧预览过期判定）
+s, pv2b = call("POST", "/api/reagents/merge/preview",
+               {"source_reagent_id": merge_src, "target_reagent_id": merge_tgt})
+token2b = pv2b["confirm_token"]
+s, before_step = call("GET", f"/api/plans/{merge_plan}")
+before_row = next(x for x in before_step["steps"] if x["id"] == confirmed_src_step_id)
+# 等待 >1 微秒，确保"再次确认"的确认时间与预览前可区分（DATETIME 精度到微秒）
+time.sleep(0.01)
+s, su = call("PUT", f"/api/plans/{merge_plan}/steps/{confirmed_src_step_id}/safety",
+             {"safety_measures": before_row["safety_measures"],
+              "safety_note": before_row["safety_note"], "confirmed": True})
+check("再次确认成功（措施/备注未变）", s == 200 and su["safety"]["confirmed"] is True, (s, su))
+check("确认指纹仍有效、措施与备注未变",
+      su["safety"]["measures"] == before_row["safety_measures"]
+      and su["safety"]["note"] == before_row["safety_note"]
+      and su["safety"]["confirmed_at"] != before_row["safety_confirmed_at"],
+      su["safety"])
+s, e = call("POST", "/api/reagents/merge/confirm",
+            {"source_reagent_id": merge_src, "target_reagent_id": merge_tgt,
+             "confirm_token": token2b})
+check("仅确认时间刷新也被拒 409（提示重新预览）",
+      s == 409 and "重新预览" in e["detail"] and "确认时间" in e["detail"], (s, e))
+s, e2b = call("POST", "/api/reagents/merge/confirm",
+              {"source_reagent_id": merge_src, "target_reagent_id": merge_tgt,
+               "confirm_token": token2b})
+check("该令牌同样一次性（再次使用拒绝）", s == 409, (s, e2b))
+s, still_src2b = call("GET", f"/api/reagents/{merge_src}")
+check("拒绝后来源档案仍在（不删除来源档案）", s == 200 and still_src2b["id"] == merge_src, s)
+s, mp_unchanged2b = call("GET", f"/api/plans/{merge_plan}")
+check("拒绝后引用未迁移（仍指向来源档案）", all(
+    (st["reagent_id"] == merge_src) == (st["id"] in src_step_ids)
+    for st in mp_unchanged2b["steps"]), mp_unchanged2b["steps"])
 
 # 重新预览 → 确认成功
 s, pv3 = call("POST", "/api/reagents/merge/preview",

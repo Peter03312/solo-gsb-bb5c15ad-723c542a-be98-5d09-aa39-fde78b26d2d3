@@ -8,7 +8,9 @@
    令牌绑定预览时刻的档案属性指纹与受影响步骤快照指纹；
 2. ``confirm_merge``：重新计算两侧属性与受影响步骤快照，与令牌比对——
    任一档案属性或任一受影响步骤发生变化（含步骤被删除 / 迁出、新增引用），
-   拒绝提交（409）并要求重新预览；通过后在**单个事务**内完成：
+   或步骤经既有安全确认接口被**再次确认**（措施 / 备注 / 确认指纹未变，仅确认
+   时间 ``safety_confirmed_at`` 被刷新），均拒绝提交（409）并要求重新预览；
+   通过后在**单个事务**内完成：
    步骤引用迁移 → 步骤展示快照（试剂名 / 类别）更新 → 已确认步骤安全确认
    转待复核 → 删除来源档案。任一步失败整体回滚，不留下部分迁移。
 
@@ -74,6 +76,9 @@ def _affected_steps(db: Session, source_id: int) -> list[models.Step]:
 # 受影响步骤纳入快照指纹的字段：迁移只改 reagent_id / reagent_name / categories
 # 与安全待复核标记，故步骤本身的引用关系、顺序、用量、时刻、备注、既有安全
 # 确认数据只要变化（含步骤被删除）就与预览不一致，必须拒绝并重新预览。
+# safety_confirmed_at 必须一并纳入：预览后通过安全确认接口"再次确认"时，即便
+# 措施 / 备注 / 确认指纹都未变，确认时间也会被刷新——这种"同内容的重新确认"
+# 同样使旧预览过期，不能凭旧令牌迁移（否则将按旧预览执行）。
 _STEP_SNAPSHOT_FIELDS = (
     "id",
     "plan_id",
@@ -84,7 +89,11 @@ _STEP_SNAPSHOT_FIELDS = (
     "amount_ml",
     "time_offset_min",
     "note",
+    "safety_measures",
+    "safety_note",
     "safety_confirmed",
+    "safety_confirmed_at",
+    "safety_confirmed_fp",
     "safety_stale",
 )
 
@@ -92,9 +101,13 @@ _STEP_SNAPSHOT_FIELDS = (
 def _step_fingerprint(step: models.Step) -> str:
     parts = {key: getattr(step, key) for key in _STEP_SNAPSHOT_FIELDS}
     parts["categories"] = json.loads(step.categories or "[]")
+    # 措施按 JSON 数组语义比对（唯一写入方 safety.apply_safety 也做 canonical 序列化）；
+    # 备注 / 确认标记 / 确认时间 / 确认指纹 / 待复核标记已由字段元组覆盖，这里只需
+    # 把 DATETIME 规范化为 ISO 字符串，避免直接 JSON 序列化口径不一致。
     parts["safety_measures"] = json.loads(step.safety_measures or "[]")
-    parts["safety_note"] = step.safety_note
-    parts["safety_confirmed_fp"] = step.safety_confirmed_fp
+    parts["safety_confirmed_at"] = (
+        step.safety_confirmed_at.isoformat() if step.safety_confirmed_at else None
+    )
     return _sha(parts)
 
 
@@ -299,8 +312,9 @@ def confirm_merge(db: Session, source_id: int, target_id: int, token: str) -> di
     if current_ids != record["step_ids"] or _sha([_step_fingerprint(s) for s in steps]) != record["steps_fp"]:
         raise HTTPException(
             409,
-            "受影响的方案步骤在预览后已变化（步骤被修改 / 删除或来源档案新增了引用），"
-            "请重新预览后再确认。",
+            "受影响的方案步骤在预览后已变化（步骤被修改 / 删除、来源档案新增了引用，"
+            "或步骤被再次安全确认 / 取消确认——即使措施、备注与确认指纹未变，确认时间"
+            "已更新），请重新预览后再确认。",
         )
 
     try:

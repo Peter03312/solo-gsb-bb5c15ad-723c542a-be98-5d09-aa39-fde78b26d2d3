@@ -1408,7 +1408,8 @@ function renderMergePreview(preview) {
       历史推演报告保持原快照不变。</p>
     <ul class="item-list">${plansHtml}</ul>
     <p class="hint">确认令牌仅对本次预览有效（${preview.token_expires_in_seconds} 秒内一次性使用）；
-      预览后任一档案属性或受影响步骤变化，提交将被拒绝，需要重新预览。</p>
+      预览后任一档案属性或受影响步骤变化（含对步骤<b>再次安全确认</b>——即使措施 / 备注未变，仅确认时间刷新），
+      提交将被拒绝，需要重新预览。</p>
     <div class="form-actions">
       <button type="button" class="btn btn-primary btn-danger" id="btnMergeConfirm">✅ 确认合并并删除来源档案</button>
       <button type="button" class="btn" id="btnMergeRepreview">↻ 重新预览</button>
